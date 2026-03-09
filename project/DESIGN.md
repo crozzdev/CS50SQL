@@ -2,7 +2,7 @@
 
 By Juan David Toro Velez a.k.a @crozzdev
 
-Video overview: <URL HERE>
+Video overview: <https://www.youtube.com/watch?v=utZkApeLwhw>
 
 ## Scope
 
@@ -148,9 +148,49 @@ As detailed by the diagram:
 
 ## Optimizations
 
-In this section you should answer the following questions:
+To improve query performance for the most frequent access patterns in the
+application, the following indexes are defined:
 
-- Which optimizations (e.g., indexes, views) did you create? Why?
+### `idx_transactions_account_date`
+
+A composite index on `transactions (account_id, date)`. This is the most
+important index in the schema, as the most frequent query pattern is
+fetching transactions for a specific account filtered or sorted by date,
+such as "show me all transactions for this account in the last 30 days".
+The composite index serves both account-only lookups (using the leftmost
+column) and account + date range lookups efficiently. This index also makes a standalone `account_id` index redundant, as SQLite can use the leftmost column of a composite index for single-column lookups.
+
+### `idx_accounts_user_id`
+
+An index on `accounts (user_id)`. Every time the application loads a user's
+accounts — which happens on virtually every screen — this index is hit.
+Without it, the database would scan all accounts to find those belonging to
+a specific user.
+
+### `idx_budgets_account_id`
+
+An index on `budgets (account_id)`. Budget queries are always scoped to a
+specific account, making this index essential for the budget tracking
+feature.
+
+### `idx_transaction_tags_tag_id`
+
+An index on `transaction_tags (tag_id)`. The primary key on `transaction_tags`
+already implicitly indexes `(transaction_id, tag_id)`, covering lookups in
+the direction of "give me all tags for a transaction". This additional index
+covers the opposite direction — "give me all transactions for a given tag"
+— which is needed to support tag-based filtering of transactions. A
+composite index was not used here because both query directions need to be
+served independently.
+
+### Indexes Deliberately Omitted
+
+The following indexes were considered but intentionally left out:
+
+- `transactions (currency_id)` — transactions are never queried by currency directly. Currency is resolved after fetching transactions by account.
+- `accounts (bank_id)` — bank is a display attribute on accounts, not a
+  filter criterion in typical application queries.
+- `accounts (currency_id)` — same reasoning as bank; currency on an account is resolved at display time, not used to filter accounts.
 
 ## Limitations
 
@@ -160,16 +200,90 @@ In this section you should answer the following questions:
 
 - Finally, as already mentioned in the scope, the database does not support real-time currency conversion, which means that the conversion rates for different currencies will be fixed and not updated in real time. This is a limitation because currency conversion rates can fluctuate frequently, and having fixed rates may not accurately reflect the current value of transactions and budgets in different currencies. A potential solution to this limitation would be to integrate an external API in the application layer that provides real-time currency conversion rates, allowing the database to update the conversion rates automatically and ensure that the values of transactions and budgets are always accurate.
 
-thanks, can you please generate some sample data:
+## Triggers
 
-First, let's add two users: Juan and Natalia, emails: <juan@example.com> and <natalia@example.com>, passwords: example_1, example_2
+To maintain data integrity and keep account balances accurate automatically, the database implements a set of triggers grouped into three categories:
+budget triggers, transaction validation, and transaction balance triggers.
 
-Secondly, let's add three banks: RappiPay , country: Colombia, Davivienda, country: Colombia and Bank of America: USA
+### Budget Triggers
 
-Third, let's add three tags: salary, food, travel
+#### `check_budget_amount`
 
-Fourth, let's add three currencies: COP, EURO, US Dollar
+Fires **BEFORE INSERT** on `budgets`. Raises an abort error if the budget amount exceeds the current balance of the associated account. Since budgets
+are always denominated in the account's currency, no currency conversion is needed.
 
-Fifth, in the conversion rate table let's add the conversion rate for each combination of the currency with the rates as of today
+#### `update_balance_amount_insert_budget`
 
-Sixth, Juan has had t transactions so far, one in January and other in February, the one in january was 9M COP type income, and the same in February,
+Fires **AFTER INSERT** on `budgets`. Deducts the budget amount from the associated account's balance, reserving those funds for the budget.
+
+#### `update_balance_amount_update_budget`
+
+Fires **AFTER UPDATE** on `budgets`. Adjusts the account balance by the delta between the old and new budget amounts using the formula `balance - (NEW.amount - OLD.amount)`, ensuring only the difference is applied rather than reversing and reapplying the full amount.
+
+#### `update_balance_amount_deleted_budget`
+
+Fires **AFTER DELETE** on `budgets`. Restores the budget amount back to the associated account's balance, as the reserved funds are no longer committed.
+
+### Transaction Triggers
+
+#### `check_balance_amount`
+
+Fires **BEFORE INSERT** on `transactions`. Only applies to expense transactions. Raises an abort error if the transaction amount would exceed the account's current balance. Handles both same-currency and different-currency cases — for the latter, it converts the transaction amount using the corresponding rate from the `conversion_rates` table before comparing against the balance.
+
+#### `update_balance_amount_income_insert`
+
+Fires **AFTER INSERT** on `transactions`. Applies to income transactions in the **same currency** as the account. Adds the transaction amount directly
+to the account balance.
+
+#### `update_balance_amount_expense_insert`
+
+Fires **AFTER INSERT** on `transactions`. Applies to expense transactions in the **same currency** as the account. Deducts the transaction amount from
+the account balance.
+
+#### `update_balance_amount_income_insert_different_currency`
+
+Fires **AFTER INSERT** on `transactions`. Applies to income transactions in a **different currency** than the account. Converts the transaction amount
+using the rate from `conversion_rates` and adds the converted value to the account balance.
+
+#### `update_balance_amount_expense_insert_different_currency`
+
+Fires **AFTER INSERT** on `transactions`. Applies to expense transactions in a **different currency** than the account. Converts the transaction amount
+using the rate from `conversion_rates` and deducts the converted value from the account balance.
+
+#### `update_balance_amount_income_delete`
+
+Fires **AFTER DELETE** on `transactions`. Reverses a previously recorded income in the **same currency** by deducting the amount from the account
+balance.
+
+#### `update_balance_amount_income_delete_different_currency`
+
+Fires **AFTER DELETE** on `transactions`. Reverses a previously recorded income in a **different currency** by converting the amount and deducting
+it from the account balance.
+
+#### `update_balance_amount_expense_delete`
+
+Fires **AFTER DELETE** on `transactions`. Reverses a previously recorded expense in the **same currency** by restoring the amount to the account
+balance.
+
+#### `update_balance_amount_expense_delete_different_currency`
+
+Fires **AFTER DELETE** on `transactions`. Reverses a previously recorded expense in a **different currency** by converting the amount and restoring
+it to the account balance.
+
+#### `update_balance_on_transaction_update`
+
+Fires **AFTER UPDATE** on `transactions`. This is the most comprehensive trigger, handling all possible update scenarios including changes to amount,
+type (income/expense), and currency simultaneously. It applies a two-step
+formula:
+
+1. **Reverse the OLD transaction** — undoes the effect of the original transaction on the balance, accounting for its original type and currency.
+2. **Apply the NEW transaction** — applies the updated transaction to the balance, accounting for its new type and currency.
+
+Both steps use a `CASE` expression to handle same-currency and different-currency scenarios independently, with an `ELSE 0` fallback to prevent NULL propagation. This single trigger replaces what would otherwise require multiple triggers to cover every combination of field changes.
+
+### Design Rationale
+
+Encapsulating balance logic in triggers rather than the application layer provides two key guarantees. First, **consistency** — the balance is always updated correctly regardless of how or where a transaction or budget is created, whether through the application, a script, or direct SQL access.
+Second, **atomicity** — the balance update executes within the same database transaction as the INSERT, UPDATE, or DELETE, so it is impossible for a transaction to be recorded without its corresponding balance adjustment.
+
+An additional reason for choosing stored balance with triggers over a computed view is **validation performance**. Both the `check_budget_amount` and `check_balance_amount` triggers need to verify that the account has sufficient funds before allowing an INSERT. With a stored `balance` column this is a single, fast lookup against an indexed primary key. With a computed view, every validation would require aggregating the entire transaction history for that account on each INSERT, an operation that grows slower as the number of transactions increases. By storing the balance and keeping it synchronized through triggers, the database pays the synchronization cost once at write time and keeps all validations cheap and constant regardless of how large the transaction history becomes. This is the same reasoning behind how real-world banking systems maintain a running balance rather than recomputing it from the full ledger on every operation.
